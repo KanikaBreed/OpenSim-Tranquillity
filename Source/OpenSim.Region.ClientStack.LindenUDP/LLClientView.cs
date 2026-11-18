@@ -10853,7 +10853,8 @@ public class LLClientView : IClientAPI, IClientCore, IClientIM, IClientChat, ICl
             SalePrice = parcelPropertiesPacket.ParcelData.SalePrice,
             SnapshotID = parcelPropertiesPacket.ParcelData.SnapshotID,
             UserLocation = parcelPropertiesPacket.ParcelData.UserLocation,
-            UserLookAt = parcelPropertiesPacket.ParcelData.UserLookAt
+            UserLookAt = parcelPropertiesPacket.ParcelData.UserLookAt,
+            WithoutMediaDetailsAndAvatarSettings = true
         };
 
         c.OnParcelPropertiesUpdateRequest?.Invoke(args, parcelPropertiesPacket.ParcelData.LocalID, c);
