@@ -1,0 +1,52 @@
+name: flaky test hunt
+
+# Runs the whole test suite several times at once and reports every test whose outcome differs between
+# runs (passed in some, failed in others), tests that failed every time, and test hosts that crashed or hung.
+on:
+  push:
+    branches:
+      - 'hunt/**'
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1, 2, 3, 4, 5, 6]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+    - uses: dotnet/nbgv@v0.4.1
+    - run: dotnet restore ./Tranquillity.sln
+    - run: dotnet build ./Tranquillity.sln --configuration Release --no-restore
+    - name: Test
+      continue-on-error: true
+      run: >
+        dotnet test ./Tranquillity.sln --configuration Release --no-build
+        --logger "trx;LogFilePrefix=results" --results-directory TestResults
+        --blame-hang --blame-hang-timeout 15m --blame-hang-dump-type none
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: round-${{ matrix.round }}
+        path: TestResults/**/*.trx
+        retention-days: 14
+
+  report:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/download-artifact@v4
+      with:
+        path: rounds
+    - name: Report
+      run: python3 tools/flaky-report.py rounds | tee -a "$GITHUB_STEP_SUMMARY"
