@@ -705,7 +705,9 @@ public class LLClientView : IClientAPI, IClientCore, IClientIM, IClientChat, ICl
             kupack.TargetBlock.TargetIP = 0;
             kupack.TargetBlock.TargetPort = 0;
             kupack.UserInfo.Reason = Util.StringToBytes256(message);
-            OutPacket(kupack, ThrottleOutPacketType.Task);
+            // sent at once, not queued behind the region's object updates, as LogoutReply is: the close that follows
+            // drops the client's queues
+            OutPacket(kupack, ThrottleOutPacketType.Unknown);
             // You must sleep here or users get no message!
             Thread.Sleep(500);
         }
@@ -5787,7 +5789,7 @@ public class LLClientView : IClientAPI, IClientCore, IClientIM, IClientChat, ICl
                 PrimUpdateFlags flags = PrimUpdateFlags.CancelKill;
                 if(viewerCache && grp.IsViewerCachable)
                     flags |= PrimUpdateFlags.UpdateProbe;
-                foreach (SceneObjectPart p in grp.Parts)
+                foreach (SceneObjectPart p in grp.PartsInLinkOrder)
                     SendEntityUpdate(p, flags);
             }
         }
@@ -5939,7 +5941,7 @@ public class LLClientView : IClientAPI, IClientCore, IClientIM, IClientChat, ICl
                     PrimUpdateFlags flags = PrimUpdateFlags.CancelKill;
                     if (grp.IsViewerCachable)
                         flags |= PrimUpdateFlags.UpdateProbe;
-                    foreach (SceneObjectPart p in grp.Parts)
+                    foreach (SceneObjectPart p in grp.PartsInLinkOrder)
                         SendEntityUpdate(p, flags);
                 }
             }
@@ -5949,7 +5951,7 @@ public class LLClientView : IClientAPI, IClientCore, IClientIM, IClientChat, ICl
                 PrimUpdateFlags flags = PrimUpdateFlags.CancelKill;
                 foreach (SceneObjectGroup grp in GroupsNeedFullUpdate)
                 {
-                    foreach (SceneObjectPart p in grp.Parts)
+                    foreach (SceneObjectPart p in grp.PartsInLinkOrder)
                         SendEntityUpdate(p, flags);
                 }
             }
