@@ -142,6 +142,57 @@ public partial class BunchOfCaps
     }
 
     /// <summary>
+    /// The SetScriptEngine capability: {task_id, item_id, target} chooses the engine of a script in an object without
+    /// saving its text (<see cref="Scene.SetScriptEngine"/>); an empty or missing target clears the choice. The reply is
+    /// {state: "complete", result, EngineChoice} when the choice is in place (result "Changed" or "Unchanged"), and
+    /// {state: "error", result, error} otherwise, where result names the <see cref="ScriptEngineChoiceResult"/>.
+    /// </summary>
+    public void SetScriptEngineRequest(IOSHttpRequest httpRequest, IOSHttpResponse httpResponse, OSDMap map)
+    {
+        httpResponse.StatusCode = (int)HttpStatusCode.OK;
+        UUID itemID = UUID.Zero;
+        UUID objectID = UUID.Zero;
+        string target = null;
+        if (map.TryGetValue("item_id", out OSD tmp))
+            itemID = tmp.AsUUID();
+        if (map.TryGetValue("task_id", out tmp))
+            objectID = tmp.AsUUID();
+        if (map.TryGetValue("target", out tmp))
+            target = tmp.AsString();
+
+        OSDMap reply = new();
+        if (itemID.IsZero() || objectID.IsZero())
+        {
+            reply["state"] = "error";
+            reply["result"] = "BadRequest";
+            reply["error"] = "task_id and item_id are needed";
+        }
+        else
+        {
+            ScriptEngineChoiceResult result = m_Scene.SetScriptEngine(m_AgentID, objectID, itemID, target);
+            reply["result"] = result.ToString();
+            if (result == ScriptEngineChoiceResult.Changed || result == ScriptEngineChoiceResult.Unchanged)
+            {
+                reply["state"] = "complete";
+                reply["EngineChoice"] = m_Scene.GetScriptEngineChoice(objectID, itemID);
+            }
+            else
+            {
+                reply["state"] = "error";
+                reply["error"] = result switch
+                {
+                    ScriptEngineChoiceResult.NotFound => "script not found",
+                    ScriptEngineChoiceResult.NotAllowed => "no permission to choose this script's engine",
+                    ScriptEngineChoiceResult.Disabled => "this region keeps no script engine choices",
+                    ScriptEngineChoiceResult.UnknownEngine => "no such script engine",
+                    _ => result.ToString(),
+                };
+            }
+        }
+        httpResponse.RawBuffer = OSDParser.SerializeLLSDXmlBytes(reply);
+    }
+
+    /// <summary>
     /// Called by the script task update handler.  Provides a URL to which the client can upload a new asset.
     /// </summary>
     /// <param name="httpRequest">HTTP request header object</param>
@@ -223,7 +274,7 @@ public partial class BunchOfCaps
 
             TaskInventoryScriptUpdater uploader = new TaskInventoryScriptUpdater(itemID, objectID, is_script_running, experience_key,
                     uploaderPath, m_HostCapsObj.HttpListener, httpRequest.RemoteIPEndPoint.Address, m_dumpAssetsToFile, compileTarget);
-            uploader.OnUpLoad += TaskScriptUpdated;
+            uploader.OnSave += TaskScriptUpdated;
 
             var uploaderHandler = new SimpleBinaryHandler("POST", uploaderPath, uploader.process);
 
@@ -258,6 +309,42 @@ public partial class BunchOfCaps
                 errors.Add(item);
         }
     }
+
+    /// <summary>
+    /// The task script save, giving the id of the asset the save stored in <paramref name="newAssetID"/> (UUID.Zero
+    /// when it stored nothing). It uses <see cref="TaskScriptSavedCall"/>, unless a module replaced
+    /// <see cref="TaskScriptUpdatedCall"/> and left <see cref="TaskScriptSavedCall"/> as it was: then the replaced
+    /// callback does the save, as it did before <see cref="TaskScriptSavedCall"/> existed, and the item's asset is read
+    /// before and after it; an asset id that did not change means nothing was stored.
+    /// </summary>
+    public void TaskScriptUpdated(UUID itemID, UUID primID, bool isScriptRunning, UUID experience, byte[] data, string compileTarget,
+                                  ref ArrayList errors, out UUID newAssetID)
+    {
+        newAssetID = UUID.Zero;
+        ArrayList e = null;
+        bool updatedReplaced = TaskScriptUpdatedCall != m_defaultTaskScriptUpdatedCall;
+        bool savedReplaced = TaskScriptSavedCall != m_defaultTaskScriptSavedCall;
+        if (TaskScriptSavedCall != null && (savedReplaced || !updatedReplaced))
+        {
+            e = TaskScriptSavedCall(m_HostCapsObj.AgentID, itemID, primID, isScriptRunning, experience, data, compileTarget, out newAssetID);
+        }
+        else if (TaskScriptUpdatedCall != null)
+        {
+            UUID before = ItemAsset(itemID, primID);
+            e = TaskScriptUpdatedCall(m_HostCapsObj.AgentID, itemID, primID, isScriptRunning, experience, data, compileTarget);
+            UUID after = ItemAsset(itemID, primID);
+            if (after != before)
+                newAssetID = after;
+        }
+        if (e != null)
+        {
+            foreach (Object item in e)
+                errors.Add(item);
+        }
+    }
+
+    private UUID ItemAsset(UUID itemID, UUID primID)
+        => m_Scene.GetSceneObjectPart(primID)?.Inventory.GetInventoryItem(itemID)?.AssetID ?? UUID.Zero;
 
     static public bool ValidateAssetData(byte assetType, byte[] data)
     {
@@ -356,6 +443,12 @@ public partial class BunchOfCaps
     public class TaskInventoryScriptUpdater : ExpiringCapBase
     {
         public event UpdateTaskScript OnUpLoad;
+
+        /// <summary>
+        /// Used instead of <see cref="OnUpLoad"/> when set: its reply names the stored asset, or is an error when the
+        /// save stored nothing.
+        /// </summary>
+        public event SaveTaskScript OnSave;
         private UUID m_inventoryItemID;
         private UUID m_primID;
         private bool m_isScriptRunning;
@@ -395,7 +488,7 @@ public partial class BunchOfCaps
                 return;
             }
 
-            if (OnUpLoad == null)
+            if (OnUpLoad == null && OnSave == null)
             {
                 response.StatusCode = (int)HttpStatusCode.Gone;
                 return;
@@ -409,15 +502,38 @@ public partial class BunchOfCaps
 
             response.StatusCode = (int)HttpStatusCode.OK;
 
+            // new_asset is the id of the asset the save stored, as in the UpdateScriptAgent reply: the LL viewer
+            // reads it as the script's new asset id (LLBufferedAssetUploadInfo::finishUpload, llviewerassetupload.cpp).
+            // The save sets it as soon as the asset is stored, so it is known even if starting the script throws.
+            UUID newAsset = UUID.Zero;
+            SaveTaskScript save = OnSave;
             try
             {
                 string res = String.Empty;
                 LLSDTaskScriptUploadComplete uploadComplete = new LLSDTaskScriptUploadComplete();
 
                 ArrayList errors = new ArrayList();
-                OnUpLoad?.Invoke(m_inventoryItemID, m_primID, m_isScriptRunning, m_experienceKey, data, m_compileTarget, ref errors);
+                if (save != null)
+                {
+                    save(m_inventoryItemID, m_primID, m_isScriptRunning, m_experienceKey, data, m_compileTarget, ref errors, out newAsset);
+                    if (newAsset.IsZero())
+                    {
+                        // Nothing was stored. The viewer treats a reply whose state is not "complete" as a failed
+                        // upload and shows its message (LLViewerAssetUpload::AssetInventoryUploadCoproc).
+                        LLSDAssetUploadError failed = new LLSDAssetUploadError();
+                        failed.message = "could not update script";
+                        failed.identifier = m_inventoryItemID;
+                        response.RawBuffer = Util.UTF8NBGetbytes(LLSDHelpers.SerialiseLLSDReply(failed));
+                        return;
+                    }
+                }
+                else
+                {
+                    OnUpLoad?.Invoke(m_inventoryItemID, m_primID, m_isScriptRunning, m_experienceKey, data, m_compileTarget, ref errors);
+                    newAsset = m_inventoryItemID;
+                }
 
-                uploadComplete.new_asset = m_inventoryItemID;
+                uploadComplete.new_asset = newAsset;
                 uploadComplete.compiled = errors.Count > 0 ? false : true;
                 uploadComplete.state = "complete";
                 uploadComplete.errors = new OpenSim.Framework.Capabilities.OSDArray();
@@ -435,6 +551,19 @@ public partial class BunchOfCaps
             }
             catch
             {
+                if (save != null && !newAsset.IsZero())
+                {
+                    // The script was stored and the item points at it; only what came after failed. Say so, so the
+                    // viewer's editor takes the stored asset and shows the error.
+                    LLSDTaskScriptUploadComplete stored = new LLSDTaskScriptUploadComplete();
+                    stored.new_asset = newAsset;
+                    stored.compiled = false;
+                    stored.state = "complete";
+                    stored.errors = new OpenSim.Framework.Capabilities.OSDArray();
+                    stored.errors.Array = new ArrayList { "could not compile script" };
+                    response.RawBuffer = Util.UTF8NBGetbytes(LLSDHelpers.SerialiseLLSDReply(stored));
+                    return;
+                }
                 LLSDAssetUploadError error = new LLSDAssetUploadError();
                 error.message = "could not compile script";
                 error.identifier = UUID.Zero;
